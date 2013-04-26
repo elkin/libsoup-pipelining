@@ -20,6 +20,8 @@
 #include "soup-date.h"
 #include "soup-form.h"
 #include "soup-headers.h"
+#include "soup-io-dispatcher-server.h"
+#include "soup-message.h"
 #include "soup-message-private.h"
 #include "soup-marshal.h"
 #include "soup-path-map.h" 
@@ -80,6 +82,7 @@ struct SoupClientContext {
 	SoupSocket     *sock;
 	SoupMessage    *msg;
 	SoupAuthDomain *auth_domain;
+	SoupIODispatcher *io_disp;
 	char           *auth_user;
 
 	int             ref_count;
@@ -106,6 +109,7 @@ typedef struct {
 
 	SoupSocket        *listen_sock;
 	GSList            *clients;
+	GQueue			  *avail_io_disp;
 
 	gboolean           raw_paths;
 	SoupPathMap       *handlers;
@@ -141,6 +145,8 @@ static void set_property (GObject *object, guint prop_id,
 			  const GValue *value, GParamSpec *pspec);
 static void get_property (GObject *object, guint prop_id,
 			  GValue *value, GParamSpec *pspec);
+static void io_dispatcher_disconnected (SoupIODispatcher *io_disp,
+		GParamSpec  *pspec, SoupServerPrivate *priv);
 
 static void
 free_handler (SoupServerHandler *hand)
@@ -155,6 +161,7 @@ soup_server_init (SoupServer *server)
 	SoupServerPrivate *priv = SOUP_SERVER_GET_PRIVATE (server);
 
 	priv->handlers = soup_path_map_new ((GDestroyNotify)free_handler);
+	priv->avail_io_disp = g_queue_new ();
 }
 
 static void
@@ -163,6 +170,7 @@ finalize (GObject *object)
 	SoupServer *server = SOUP_SERVER (object);
 	SoupServerPrivate *priv = SOUP_SERVER_GET_PRIVATE (server);
 	GSList *iter;
+	SoupIODispatcher *io_disp;
 
 	if (priv->iface)
 		g_object_unref (priv->iface);
@@ -183,10 +191,8 @@ finalize (GObject *object)
 
 		priv->clients = g_slist_remove (priv->clients, client);
 
-		if (client->msg) {
+		if (client->msg)
 			soup_message_set_status (client->msg, SOUP_STATUS_IO_ERROR);
-			soup_message_io_finished (client->msg);
-		}
 
 		soup_socket_disconnect (sock);
 		g_object_unref (sock);
@@ -204,6 +210,11 @@ finalize (GObject *object)
 		g_main_loop_unref (priv->loop);
 	if (priv->async_context)
 		g_main_context_unref (priv->async_context);
+
+	while ((io_disp = g_queue_pop_head(priv->avail_io_disp))) {
+	    g_object_unref (io_disp);
+	}
+	g_queue_free(priv->avail_io_disp);
 
 	G_OBJECT_CLASS (soup_server_parent_class)->finalize (object);
 }
@@ -644,6 +655,18 @@ get_property (GObject *object, guint prop_id,
 	}
 }
 
+static void
+io_dispatcher_disconnected (SoupIODispatcher *io_disp, GParamSpec  *pspec,
+		SoupServerPrivate *priv)
+{
+    if (!soup_io_dispatcher_get_socket (io_disp)) {
+        soup_io_dispatcher_set_pipelining_support (io_disp, TRUE);
+        soup_io_dispatcher_set_max_pipelined_requests(io_disp, 0);
+        g_queue_push_tail(priv->avail_io_disp, io_disp);
+    }
+}
+
+
 /**
  * soup_server_new:
  * @optname1: name of first property to set
@@ -735,9 +758,23 @@ static SoupClientContext *
 soup_client_context_new (SoupServer *server, SoupSocket *sock)
 {
 	SoupClientContext *client = g_slice_new0 (SoupClientContext);
+	SoupServerPrivate *priv = SOUP_SERVER_GET_PRIVATE (server);
 
 	client->server = server;
 	client->sock = sock;
+
+	if (g_queue_is_empty(priv->avail_io_disp)) {
+		client->io_disp = g_object_new (SOUP_TYPE_IO_DISPATCHER_SERVER,
+				SOUP_IO_DISPATCHER_SOCKET, sock,
+				SOUP_IO_DISPATCHER_MAX_PIPELINED_REQ, 0,
+				NULL);
+		g_signal_connect (client->io_disp, "notify::socket",
+				G_CALLBACK(io_dispatcher_disconnected), priv);
+	} else {
+		client->io_disp = g_queue_pop_head (priv->avail_io_disp);
+		soup_io_dispatcher_set_socket (client->io_disp, sock);
+	}
+
 	client->ref_count = 1;
 
 	return client;
@@ -769,6 +806,10 @@ soup_client_context_unref (SoupClientContext *client)
 {
 	if (--client->ref_count == 0) {
 		soup_client_context_cleanup (client);
+	    if (client->io_disp) {
+	        soup_io_dispatcher_set_socket(client->io_disp, NULL);
+	        client->io_disp = NULL;
+	    }
 		g_slice_free (SoupClientContext, client);
 	}
 }
@@ -937,6 +978,7 @@ start_request (SoupServer *server, SoupClientContext *client)
 	msg = g_object_new (SOUP_TYPE_MESSAGE,
 			    SOUP_MESSAGE_SERVER_SIDE, TRUE,
 			    NULL);
+	g_object_set_data (G_OBJECT (msg), "io-disp", client->io_disp);
 	client->msg = msg;
 
 	if (priv->server_header) {
@@ -951,8 +993,7 @@ start_request (SoupServer *server, SoupClientContext *client)
 		       msg, client);
 
 	g_object_ref (client->sock);
-	soup_message_read_request (msg, client->sock,
-				   request_finished, client);
+	soup_io_dispatcher_process_message (client->io_disp, msg, NULL, request_finished, client);
 }
 
 static void
@@ -1465,7 +1506,7 @@ soup_server_pause_message (SoupServer *server,
 	g_return_if_fail (SOUP_IS_SERVER (server));
 	g_return_if_fail (SOUP_IS_MESSAGE (msg));
 
-	soup_message_io_pause (msg);
+	soup_io_dispatcher_pause_message (g_object_get_data(G_OBJECT (msg), "io-disp"), msg);
 }
 
 /**
@@ -1486,6 +1527,16 @@ soup_server_unpause_message (SoupServer *server,
 	g_return_if_fail (SOUP_IS_SERVER (server));
 	g_return_if_fail (SOUP_IS_MESSAGE (msg));
 
-	soup_message_io_unpause (msg);
+    soup_io_dispatcher_unpause_message (g_object_get_data(G_OBJECT (msg), "io-disp"), msg);
+}
+
+void
+soup_server_cancel_message (SoupServer *server,
+                 SoupMessage *msg)
+{
+    g_return_if_fail (SOUP_IS_SERVER (server));
+    g_return_if_fail (SOUP_IS_MESSAGE (msg));
+
+    soup_io_dispatcher_cancel_message (g_object_get_data(G_OBJECT (msg), "io-disp"), msg);
 }
 

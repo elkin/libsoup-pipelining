@@ -18,6 +18,8 @@
 #include "soup-auth-digest.h"
 #include "soup-auth-manager-ntlm.h"
 #include "soup-connection.h"
+#include "soup-io-dispatcher-client.h"
+#include "soup-io-dispatcher-pool.h"
 #include "soup-marshal.h"
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
@@ -66,7 +68,6 @@ typedef struct {
 	guint        num_conns;
 
 	guint        num_messages;
-
 	gboolean     ssl_fallback;
 
 	GSource     *keep_alive_src;
@@ -91,6 +92,7 @@ typedef struct {
 
 	GHashTable *http_hosts, *https_hosts; /* char* -> SoupSessionHost */
 	GHashTable *conns; /* SoupConnection -> SoupSessionHost */
+	SoupIODispatcherPool *io_disp_pool;
 	guint num_conns;
 	guint max_conns, max_conns_per_host;
 	guint io_timeout, idle_timeout;
@@ -124,6 +126,9 @@ static void flush_queue     (SoupSession *session);
 static void auth_manager_authenticate (SoupAuthManager *manager,
 				       SoupMessage *msg, SoupAuth *auth,
 				       gboolean retrying, gpointer user_data);
+
+static void io_msg_restart (SoupIODispatcher *io_disp, SoupMessage *msg,
+                 SoupSession *session);
 
 #define SOUP_SESSION_MAX_CONNS_DEFAULT 10
 #define SOUP_SESSION_MAX_CONNS_PER_HOST_DEFAULT 2
@@ -169,7 +174,8 @@ enum {
 	PROP_REMOVE_FEATURE_BY_TYPE,
 	PROP_HTTP_ALIASES,
 	PROP_HTTPS_ALIASES,
-
+	PROP_CONN_DISTR_POL,
+	PROP_FIRST_CONN_ALLOC,
 	LAST_PROP
 };
 
@@ -516,6 +522,7 @@ soup_session_class_init (SoupSessionClass *session_class)
 				  G_MAXINT,
 				  SOUP_SESSION_MAX_CONNS_PER_HOST_DEFAULT,
 				  G_PARAM_READWRITE));
+
 	/**
 	 * SoupSession:idle-timeout:
 	 *
@@ -1098,6 +1105,7 @@ set_property (GObject *object, guint prop_id,
 	SoupURI *uri;
 	const char *user_agent;
 	SoupSessionFeature *feature;
+	SoupIODispatcherPool *io_disp_pool;
 
 	switch (prop_id) {
 	case PROP_PROXY_URI:
@@ -1115,9 +1123,13 @@ set_property (GObject *object, guint prop_id,
 		break;
 	case PROP_MAX_CONNS:
 		priv->max_conns = g_value_get_int (value);
+		io_disp_pool = soup_session_get_io_dispatcher_pool (session);
+		g_object_set (G_OBJECT (io_disp_pool), SOUP_IO_DISPATCHER_POOL_MAX_IO_DISPS, priv->max_conns, NULL);
 		break;
 	case PROP_MAX_CONNS_PER_HOST:
 		priv->max_conns_per_host = g_value_get_int (value);
+		io_disp_pool = soup_session_get_io_dispatcher_pool (session);
+		g_object_set (G_OBJECT (io_disp_pool), SOUP_IO_DISPATCHER_POOL_MAX_IO_DISPS_PER_HOST, priv->max_conns_per_host, NULL);
 		break;
 	case PROP_USE_NTLM:
 		feature = soup_session_get_feature (session, SOUP_TYPE_AUTH_MANAGER_NTLM);
@@ -1214,6 +1226,8 @@ set_property (GObject *object, guint prop_id,
 		break;
 	case PROP_IDLE_TIMEOUT:
 		priv->idle_timeout = g_value_get_uint (value);
+		io_disp_pool = soup_session_get_io_dispatcher_pool (session);
+		g_object_set (G_OBJECT (io_disp_pool), SOUP_IO_DISPATCHER_IDLE_TIMEOUT, priv->idle_timeout, NULL);
 		break;
 	case PROP_ADD_FEATURE:
 		soup_session_add_feature (session, g_value_get_object (value));
@@ -1230,6 +1244,7 @@ set_property (GObject *object, guint prop_id,
 	case PROP_HTTPS_ALIASES:
 		set_aliases (&priv->https_aliases, g_value_get_boxed (value));
 		break;
+
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 		break;
@@ -1696,6 +1711,7 @@ soup_session_send_queue_item (SoupSession *session,
 			      SoupMessageCompletionFn completion_cb)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	SoupIODispatcher *io_disp = soup_connection_get_io_dispatcher (item->conn);
 	const char *conn_header;
 
 	if (priv->user_agent) {
@@ -1725,8 +1741,8 @@ soup_session_send_queue_item (SoupSession *session,
 
 	g_signal_emit (session, signals[REQUEST_STARTED], 0,
 		       item->msg, soup_connection_get_socket (item->conn));
-	if (item->state == SOUP_MESSAGE_RUNNING)
-		soup_connection_send_request (item->conn, item, completion_cb, item);
+	if (item->state == SOUP_MESSAGE_RUNNING && io_disp)
+		soup_io_dispatcher_process_message (io_disp, item->msg, item->cancellable, completion_cb, item);
 }
 
 gboolean
@@ -1742,9 +1758,11 @@ soup_session_cleanup_connections (SoupSession *session,
 	g_mutex_lock (&priv->host_lock);
 	g_hash_table_iter_init (&iter, priv->conns);
 	while (g_hash_table_iter_next (&iter, &conn, &host)) {
+		SoupIODispatcher *io_disp = soup_connection_get_io_dispatcher(conn);
+
 		state = soup_connection_get_state (conn);
 		if (state == SOUP_CONNECTION_REMOTE_DISCONNECTED ||
-		    (prune_idle && state == SOUP_CONNECTION_IDLE))
+		    (prune_idle && soup_io_dispatcher_is_queue_empty (io_disp)))
 			conns = g_slist_prepend (conns, g_object_ref (conn));
 	}
 	g_mutex_unlock (&priv->host_lock);
@@ -1820,6 +1838,20 @@ connection_disconnected (SoupConnection *conn, gpointer user_data)
 	g_object_unref (conn);
 }
 
+static void
+io_msg_restart(SoupIODispatcher *io_disp, SoupMessage *msg, SoupSession *session)
+{
+    SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE(session);
+    SoupMessageQueueItem *item = soup_message_queue_lookup(priv->queue, msg);
+
+    // Looks like an item is destroyed
+    if (item) {
+    	soup_message_queue_item_set_connection(item, NULL);
+    	soup_session_requeue_message(session, msg);
+    	soup_message_queue_item_unref (item);
+    }
+}
+
 SoupMessageQueueItem *
 soup_session_make_connect_message (SoupSession    *session,
 				   SoupConnection *conn)
@@ -1859,17 +1891,34 @@ soup_session_get_connection (SoupSession *session,
 			     gboolean *try_pruning)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	SoupIODispatcherPool *io_disp_pool;
 	SoupConnection *conn;
 	SoupSessionHost *host;
 	SoupAddress *remote_addr, *tunnel_addr;
-	GSList *conns;
 	int num_pending = 0;
 	SoupURI *uri;
 	gboolean need_new_connection;
+	SoupIODispatcher *io_disp;
 
 	if (item->conn) {
+
+		if (soup_connection_get_state (item->conn) >= SOUP_CONNECTION_REMOTE_DISCONNECTED) {
+			soup_message_queue_item_set_connection (item, NULL);
+			*try_pruning = TRUE;
+			return FALSE;
+		}
+
 		g_return_val_if_fail (soup_connection_get_state (item->conn) != SOUP_CONNECTION_DISCONNECTED, FALSE);
-		return TRUE;
+
+		io_disp = soup_connection_get_io_dispatcher (item->conn);
+
+		if (soup_io_dispatcher_is_queue_full (io_disp)) {
+			g_object_unref (item->conn);
+			item->conn = NULL;
+		} else {
+			soup_io_dispatcher_queue_message (io_disp, item->msg);
+			return TRUE;
+		}
 	}
 
 	need_new_connection =
@@ -1879,15 +1928,19 @@ soup_session_get_connection (SoupSession *session,
 	g_mutex_lock (&priv->host_lock);
 
 	host = get_host_for_message (session, item->msg);
-	for (conns = host->connections; conns; conns = conns->next) {
-		if (!need_new_connection && soup_connection_get_state (conns->data) == SOUP_CONNECTION_IDLE) {
-			soup_connection_set_state (conns->data, SOUP_CONNECTION_IN_USE);
-			g_mutex_unlock (&priv->host_lock);
-			soup_message_queue_item_set_connection (item, conns->data);
+	uri = soup_message_get_uri (item->msg);
+
+	io_disp_pool = soup_session_get_io_dispatcher_pool (session);
+	if (!need_new_connection) {
+		if ((io_disp = soup_io_dispatcher_pool_get_io_dispatcher (io_disp_pool, item->msg,
+				uri_is_https(priv, uri), item->proxy_uri ? TRUE : FALSE))) {
+			soup_io_dispatcher_queue_message (io_disp, item->msg);
+			soup_message_queue_item_set_connection (item, soup_io_dispatcher_pool_get_conn(io_disp_pool, io_disp));
 			soup_message_set_https_status (item->msg, item->conn);
+
+			g_mutex_unlock (&priv->host_lock);
 			return TRUE;
-		} else if (soup_connection_get_state (conns->data) == SOUP_CONNECTION_CONNECTING)
-			num_pending++;
+		}
 	}
 
 	/* Limit the number of pending connections; num_messages / 2
@@ -1919,7 +1972,7 @@ soup_session_get_connection (SoupSession *session,
 		tunnel_addr = NULL;
 	}
 
-	uri = soup_message_get_uri (item->msg);
+
 	if (uri_is_https (priv, uri) && item->proxy_addr)
 		tunnel_addr = host->addr;
 
@@ -1933,9 +1986,17 @@ soup_session_get_connection (SoupSession *session,
 		SOUP_CONNECTION_ASYNC_CONTEXT, priv->async_context,
 		SOUP_CONNECTION_USE_THREAD_CONTEXT, priv->use_thread_context,
 		SOUP_CONNECTION_TIMEOUT, priv->io_timeout,
-		SOUP_CONNECTION_IDLE_TIMEOUT, priv->idle_timeout,
 		SOUP_CONNECTION_SSL_FALLBACK, host->ssl_fallback,
 		NULL);
+
+
+	/* If there are no available IO dispatchers in queue, create new and append */
+    io_disp = soup_io_dispatcher_pool_alloc_io_dispatcher (io_disp_pool, uri,
+    		priv->async_context, conn, item->proxy_uri ? TRUE : FALSE);
+	g_signal_connect (io_disp, "io_msg_restart", G_CALLBACK(io_msg_restart), session);
+
+	soup_io_dispatcher_queue_message (io_disp, item->msg);
+
 	g_signal_connect (conn, "disconnected",
 			  G_CALLBACK (connection_disconnected),
 			  session);
@@ -1975,8 +2036,6 @@ soup_session_unqueue_item (SoupSession          *session,
 	SoupSessionHost *host;
 
 	if (item->conn) {
-		if (soup_connection_get_state (item->conn) == SOUP_CONNECTION_IN_USE)
-			soup_connection_set_state (item->conn, SOUP_CONNECTION_IDLE);
 		soup_message_queue_item_set_connection (item, NULL);
 	}
 
@@ -2187,7 +2246,7 @@ soup_session_pause_message (SoupSession *session,
 
 	item->paused = TRUE;
 	if (item->state == SOUP_MESSAGE_RUNNING)
-		soup_message_io_pause (msg);
+		soup_io_dispatcher_pause_message (item->io_disp, msg);
 	soup_message_queue_item_unref (item);
 }
 
@@ -2219,7 +2278,8 @@ soup_session_unpause_message (SoupSession *session,
 
 	item->paused = FALSE;
 	if (item->state == SOUP_MESSAGE_RUNNING)
-		soup_message_io_unpause (msg);
+		soup_io_dispatcher_unpause_message(item->io_disp, msg);
+
 	soup_message_queue_item_unref (item);
 
 	SOUP_SESSION_GET_CLASS (session)->kick (session);
@@ -2675,4 +2735,12 @@ soup_session_get_feature_for_message (SoupSession *session, GType feature_type,
 	if (feature && soup_message_disables_feature (msg, feature))
 		return NULL;
 	return feature;
+}
+
+SoupIODispatcherPool*
+soup_session_get_io_dispatcher_pool (SoupSession *session)
+{
+	g_return_val_if_fail (SOUP_IS_SESSION (session), NULL);
+
+	return SOUP_SESSION_GET_CLASS (session)->get_io_dispatcher_pool (session);
 }

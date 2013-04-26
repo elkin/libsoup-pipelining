@@ -8,6 +8,7 @@
 #define SOUP_MESSAGE_QUEUE_H 1
 
 #include "soup-connection.h"
+#include "soup-io-dispatcher.h"
 #include "soup-message.h"
 #include "soup-session.h"
 
@@ -45,6 +46,7 @@ struct _SoupMessageQueueItem {
 	SoupAddress *proxy_addr;
 	SoupURI *proxy_uri;
 	SoupConnection *conn;
+	SoupIODispatcher *io_disp;
 
 	guint paused            : 1;
 	guint redirection_count : 31;

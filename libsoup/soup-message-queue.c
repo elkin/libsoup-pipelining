@@ -70,8 +70,6 @@ queue_message_restarted (SoupMessage *msg, gpointer user_data)
 	if (item->conn &&
 	    (!soup_message_is_keepalive (msg) ||
 	     SOUP_STATUS_IS_REDIRECTION (msg->status_code))) {
-		if (soup_connection_get_state (item->conn) == SOUP_CONNECTION_IN_USE)
-			soup_connection_set_state (item->conn, SOUP_CONNECTION_IDLE);
 		soup_message_queue_item_set_connection (item, NULL);
 	}
 
@@ -206,12 +204,15 @@ soup_message_queue_item_set_connection (SoupMessageQueueItem *item,
 	if (item->conn) {
 		g_signal_handlers_disconnect_by_func (item->conn, proxy_connection_event, item);
 		g_object_unref (item->conn);
+		g_object_unref (item->io_disp);
 	}
 
 	item->conn = conn;
+	item->io_disp = conn ? soup_connection_get_io_dispatcher (conn) : NULL;
 
 	if (item->conn) {
 		g_object_ref (item->conn);
+		g_object_ref (item->io_disp);
 		g_signal_connect (item->conn, "event",
 				  G_CALLBACK (proxy_connection_event), item);
 	}

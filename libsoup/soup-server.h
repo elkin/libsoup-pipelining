@@ -102,6 +102,9 @@ void               soup_server_pause_message   (SoupServer           *server,
 void               soup_server_unpause_message (SoupServer           *server,
 						SoupMessage          *msg);
 
+void               soup_server_cancel_message  (SoupServer          *server,
+                        SoupMessage          *msg);
+
 /* Client context */
 
 SoupSocket     *soup_client_context_get_socket      (SoupClientContext *client);

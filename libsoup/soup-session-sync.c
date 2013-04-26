@@ -15,9 +15,12 @@
 #include "soup-session-sync.h"
 #include "soup-session-private.h"
 #include "soup-address.h"
+#include "soup-io-dispatcher.h"
+#include "soup-io-dispatcher-pool.h"
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
 #include "soup-misc.h"
+#include "soup-misc-private.h"
 #include "soup-password-manager.h"
 #include "soup-proxy-uri-resolver.h"
 #include "soup-uri.h"
@@ -48,6 +51,7 @@
  **/
 
 typedef struct {
+	SoupIODispatcherPool *io_disp_pool;
 	GMutex lock;
 	GCond cond;
 } SoupSessionSyncPrivate;
@@ -62,6 +66,7 @@ static void  auth_required  (SoupSession *session, SoupMessage *msg,
 			     SoupAuth *auth, gboolean retrying);
 static void  flush_queue    (SoupSession *session);
 static void  kick           (SoupSession *session);
+SoupIODispatcherPool *get_io_dispatcher_pool (SoupSession *session);
 
 G_DEFINE_TYPE (SoupSessionSync, soup_session_sync, SOUP_TYPE_SESSION)
 
@@ -70,6 +75,7 @@ soup_session_sync_init (SoupSessionSync *ss)
 {
 	SoupSessionSyncPrivate *priv = SOUP_SESSION_SYNC_GET_PRIVATE (ss);
 
+	priv->io_disp_pool = NULL;
 	g_mutex_init (&priv->lock);
 	g_cond_init (&priv->cond);
 }
@@ -79,6 +85,7 @@ finalize (GObject *object)
 {
 	SoupSessionSyncPrivate *priv = SOUP_SESSION_SYNC_GET_PRIVATE (object);
 
+	g_object_unref (priv->io_disp_pool);
 	g_mutex_clear (&priv->lock);
 	g_cond_clear (&priv->cond);
 
@@ -100,6 +107,7 @@ soup_session_sync_class_init (SoupSessionSyncClass *session_sync_class)
 	session_class->auth_required = auth_required;
 	session_class->flush_queue = flush_queue;
 	session_class->kick = kick;
+	session_class->get_io_dispatcher_pool = get_io_dispatcher_pool;
 
 	object_class->finalize = finalize;
 }
@@ -146,16 +154,21 @@ tunnel_connect (SoupSession *session, SoupMessageQueueItem *related)
 {
 	SoupConnection *conn = related->conn;
 	SoupMessageQueueItem *item;
+	SoupSocket *socket = soup_connection_get_socket (conn);
 	guint status;
 
 	g_object_ref (conn);
 
 	item = soup_session_make_connect_message (session, conn);
+	g_signal_emit_by_name (conn, "event", 0,
+		       G_SOCKET_CLIENT_PROXY_NEGOTIATING,
+		       soup_socket_get_iostream (socket));
 	do {
 		soup_session_send_queue_item (session, item, NULL);
 		status = item->msg->status_code;
 		if (item->state == SOUP_MESSAGE_RESTARTING &&
-		    soup_message_io_in_progress (item->msg)) {
+				item->io_disp &&
+				soup_io_dispatcher_is_msg_in_progress(item->io_disp,  item->msg)) {
 			soup_message_restarted (item->msg);
 			item->state = SOUP_MESSAGE_RUNNING;
 		} else {
@@ -169,6 +182,9 @@ tunnel_connect (SoupSession *session, SoupMessageQueueItem *related)
 	soup_message_queue_item_unref (item);
 
 	if (SOUP_STATUS_IS_SUCCESSFUL (status)) {
+		g_signal_emit_by_name (conn, "event", 0,
+			       G_SOCKET_CLIENT_PROXY_NEGOTIATING,
+			       soup_socket_get_iostream (socket));
 		if (!soup_connection_start_ssl_sync (conn, related->cancellable))
 			status = SOUP_STATUS_SSL_FAILED;
 		soup_message_set_https_status (related->msg, conn);
@@ -475,4 +491,16 @@ kick (SoupSession *session)
 	g_mutex_lock (&priv->lock);
 	g_cond_broadcast (&priv->cond);
 	g_mutex_unlock (&priv->lock);
+}
+
+SoupIODispatcherPool*
+get_io_dispatcher_pool (SoupSession *session)
+{
+	SoupSessionSyncPrivate *priv = SOUP_SESSION_SYNC_GET_PRIVATE (session);
+
+	if (G_UNLIKELY (!priv->io_disp_pool))
+		priv->io_disp_pool = soup_io_dispatcher_pool_new (SOUP_IO_DISPATCHER_POOL_IS_THREAD_SAFE, TRUE, NULL);
+
+	return priv->io_disp_pool;
+
 }

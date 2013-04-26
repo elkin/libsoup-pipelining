@@ -12,25 +12,29 @@
 
 G_BEGIN_DECLS
 
-typedef struct _SoupAddress           SoupAddress;
-typedef struct _SoupAuth              SoupAuth;
-typedef struct _SoupAuthDomain        SoupAuthDomain;
-typedef struct _SoupCookie            SoupCookie;
-typedef struct _SoupCookieJar         SoupCookieJar;
-typedef struct _SoupDate              SoupDate;
-typedef struct _SoupMessage           SoupMessage;
-typedef struct _SoupServer            SoupServer;
-typedef struct _SoupSession           SoupSession;
-typedef struct _SoupSessionAsync      SoupSessionAsync;
-typedef struct _SoupSessionFeature    SoupSessionFeature;
-typedef struct _SoupSessionSync       SoupSessionSync;
-typedef struct _SoupSocket            SoupSocket;
-typedef struct _SoupURI               SoupURI;
+typedef struct _SoupAddress            SoupAddress;
+typedef struct _SoupAuth               SoupAuth;
+typedef struct _SoupAuthDomain         SoupAuthDomain;
+typedef struct _SoupCookie             SoupCookie;
+typedef struct _SoupCookieJar          SoupCookieJar;
+typedef struct _SoupDate               SoupDate;
+typedef struct _SoupMessage            SoupMessage;
+typedef struct _SoupServer             SoupServer;
+typedef struct _SoupSession            SoupSession;
+typedef struct _SoupSessionAsync       SoupSessionAsync;
+typedef struct _SoupSessionFeature     SoupSessionFeature;
+typedef struct _SoupSessionSync        SoupSessionSync;
+typedef struct _SoupSocket             SoupSocket;
+typedef struct _SoupURI                SoupURI;
 
 /*< private >*/
-typedef struct _SoupConnection        SoupConnection;
-typedef struct _SoupMessageQueue      SoupMessageQueue;
-typedef struct _SoupMessageQueueItem  SoupMessageQueueItem;
+typedef struct _SoupConnection         SoupConnection;
+typedef struct _SoupIODispatcher       SoupIODispatcher;
+typedef struct _SoupIODispatcherClient SoupIODispatcherClient;
+typedef struct _SoupIODispatcherServer SoupIODispatcherServer;
+typedef struct _SoupIODispatcherPool   SoupIODispatcherPool;
+typedef struct _SoupMessageQueue       SoupMessageQueue;
+typedef struct _SoupMessageQueueItem   SoupMessageQueueItem;
 
 G_END_DECLS
 

@@ -15,9 +15,12 @@
 #include "soup-session-async.h"
 #include "soup-session-private.h"
 #include "soup-address.h"
+#include "soup-io-dispatcher.h"
+#include "soup-io-dispatcher-pool.h"
 #include "soup-message-private.h"
 #include "soup-message-queue.h"
 #include "soup-misc.h"
+#include "soup-misc-private.h"
 #include "soup-password-manager.h"
 #include "soup-proxy-uri-resolver.h"
 #include "soup-uri.h"
@@ -36,6 +39,7 @@ static void do_idle_run_queue (SoupSession *session);
 
 static void  queue_message   (SoupSession *session, SoupMessage *req,
 			      SoupSessionCallback callback, gpointer user_data);
+static void  requeue_message   (SoupSession *session, SoupMessage *req);
 static guint send_message    (SoupSession *session, SoupMessage *req);
 static void  cancel_message  (SoupSession *session, SoupMessage *msg,
 			      guint status_code);
@@ -43,10 +47,12 @@ static void  kick            (SoupSession *session);
 
 static void  auth_required   (SoupSession *session, SoupMessage *msg,
 			      SoupAuth *auth, gboolean retrying);
+static SoupIODispatcherPool* get_io_dispatcher_pool (SoupSession *session);
 
 G_DEFINE_TYPE (SoupSessionAsync, soup_session_async, SOUP_TYPE_SESSION)
 
 typedef struct {
+	SoupIODispatcherPool *io_disp_pool;
 	GHashTable *idle_run_queue_sources;
 
 } SoupSessionAsyncPrivate;
@@ -64,6 +70,7 @@ soup_session_async_init (SoupSessionAsync *sa)
 {
 	SoupSessionAsyncPrivate *priv = SOUP_SESSION_ASYNC_GET_PRIVATE (sa);
 
+	priv->io_disp_pool = NULL;
 	priv->idle_run_queue_sources =
 		g_hash_table_new_full (NULL, NULL, NULL, destroy_unref_source);
 }
@@ -82,6 +89,16 @@ dispose (GObject *object)
 }
 
 static void
+finalize (GObject *object)
+{
+	SoupSessionAsyncPrivate *priv = SOUP_SESSION_ASYNC_GET_PRIVATE (object);
+
+	g_object_unref (G_OBJECT (priv->io_disp_pool));
+
+	G_OBJECT_CLASS (soup_session_async_parent_class)->finalize (object);
+}
+
+static void
 soup_session_async_class_init (SoupSessionAsyncClass *soup_session_async_class)
 {
 	SoupSessionClass *session_class = SOUP_SESSION_CLASS (soup_session_async_class);
@@ -92,12 +109,15 @@ soup_session_async_class_init (SoupSessionAsyncClass *soup_session_async_class)
 
 	/* virtual method override */
 	session_class->queue_message = queue_message;
+	session_class->requeue_message = requeue_message;
 	session_class->send_message = send_message;
 	session_class->cancel_message = cancel_message;
 	session_class->auth_required = auth_required;
 	session_class->kick = kick;
+	session_class->get_io_dispatcher_pool = get_io_dispatcher_pool;
 
 	object_class->dispose = dispose;
+	object_class->finalize = finalize;
 }
 
 
@@ -227,6 +247,7 @@ connection_closed (SoupConnection *conn, gpointer session)
 	/* Run the queue in case anyone was waiting for a connection
 	 * to be closed.
 	 */
+
 	do_idle_run_queue (session);
 }
 
@@ -266,10 +287,9 @@ ssl_tunnel_completed (SoupConnection *conn, guint status, gpointer user_data)
 	if (SOUP_STATUS_IS_SUCCESSFUL (status)) {
 		g_signal_connect (item->conn, "disconnected",
 				  G_CALLBACK (connection_closed), item->session);
-		soup_connection_set_state (item->conn, SOUP_CONNECTION_IDLE);
-		soup_connection_set_state (item->conn, SOUP_CONNECTION_IN_USE);
 
 		item->related->state = SOUP_MESSAGE_READY;
+
 	} else {
 		if (item->conn)
 			soup_connection_disconnect (item->conn);
@@ -284,6 +304,7 @@ tunnel_message_completed (SoupMessage *msg, gpointer user_data)
 {
 	SoupMessageQueueItem *item = user_data;
 	SoupSession *session = item->session;
+	SoupSocket *socket = soup_connection_get_socket (item->conn);
 
 	if (item->state == SOUP_MESSAGE_RESTARTING) {
 		soup_message_restarted (msg);
@@ -310,6 +331,10 @@ tunnel_message_completed (SoupMessage *msg, gpointer user_data)
 		tunnel_complete (item);
 		return;
 	}
+
+	g_signal_emit_by_name (item->conn, "event", 0,
+		       G_SOCKET_CLIENT_PROXY_NEGOTIATED,
+		       soup_socket_get_iostream (socket));
 
 	soup_connection_start_ssl_async (item->conn, item->cancellable,
 					 ssl_tunnel_completed, item);
@@ -352,11 +377,15 @@ got_connection (SoupConnection *conn, guint status, gpointer user_data)
 	tunnel_addr = soup_connection_get_tunnel_addr (conn);
 	if (tunnel_addr) {
 		SoupMessageQueueItem *tunnel_item;
+		SoupSocket *socket = soup_connection_get_socket (conn);
 
 		item->state = SOUP_MESSAGE_TUNNELING;
 
 		tunnel_item = soup_session_make_connect_message (session, conn);
 		tunnel_item->related = item;
+		g_signal_emit_by_name (conn, "event", 0,
+			       G_SOCKET_CLIENT_PROXY_NEGOTIATING,
+			       soup_socket_get_iostream (socket));
 		soup_session_send_queue_item (session, tunnel_item, tunnel_message_completed);
 		return;
 	}
@@ -364,6 +393,7 @@ got_connection (SoupConnection *conn, guint status, gpointer user_data)
 	item->state = SOUP_MESSAGE_READY;
 	g_signal_connect (conn, "disconnected",
 			  G_CALLBACK (connection_closed), session);
+
 	run_queue ((SoupSessionAsync *)session);
 	soup_message_queue_item_unref (item);
 	g_object_unref (session);
@@ -522,6 +552,14 @@ queue_message (SoupSession *session, SoupMessage *req,
 	do_idle_run_queue (session);
 }
 
+static void
+requeue_message   (SoupSession *session, SoupMessage *req)
+{
+    SOUP_SESSION_CLASS (soup_session_async_parent_class)->requeue_message (session, req);
+
+    do_idle_run_queue(session);
+}
+
 static guint
 send_message (SoupSession *session, SoupMessage *req)
 {
@@ -567,8 +605,9 @@ cancel_message (SoupSession *session, SoupMessage *msg,
 	 * point out that the callback will be invoked from
 	 * within the cancel call.)
 	 */
-	if (soup_message_io_in_progress (msg))
-		soup_message_io_finished (msg);
+
+	if (item->io_disp && soup_io_dispatcher_is_msg_in_progress(item->io_disp, msg))
+	    soup_io_dispatcher_cancel_message(item->io_disp, msg);
 	else if (item->state != SOUP_MESSAGE_FINISHED)
 		item->state = SOUP_MESSAGE_FINISHING;
 
@@ -615,4 +654,15 @@ static void
 kick (SoupSession *session)
 {
 	do_idle_run_queue (session);
+}
+
+static SoupIODispatcherPool*
+get_io_dispatcher_pool (SoupSession *session)
+{
+	SoupSessionAsyncPrivate *priv = SOUP_SESSION_ASYNC_GET_PRIVATE (session);
+
+	if (G_UNLIKELY (!priv->io_disp_pool))
+		priv->io_disp_pool = soup_io_dispatcher_pool_new (SOUP_IO_DISPATCHER_POOL_IS_THREAD_SAFE, FALSE, NULL);
+
+	return priv->io_disp_pool;
 }

@@ -32,27 +32,29 @@ typedef struct {
 	GObjectClass parent_class;
 
 	/* signals */
-	void (*request_started) (SoupSession *session, SoupMessage *msg,
-				 SoupSocket *socket);
-	void (*authenticate)    (SoupSession *session, SoupMessage *msg,
-				 SoupAuth *auth, gboolean retrying);
+	void                   (*request_started) (SoupSession *session, SoupMessage *msg,
+								 SoupSocket *socket);
+	void                   (*authenticate)    (SoupSession *session, SoupMessage *msg,
+								 SoupAuth *auth, gboolean retrying);
 
 	/* methods */
-	void  (*queue_message)   (SoupSession *session, SoupMessage *msg,
-				  SoupSessionCallback callback,
-				  gpointer user_data);
-	void  (*requeue_message) (SoupSession *session, SoupMessage *msg);
-	guint (*send_message)    (SoupSession *session, SoupMessage *msg);
+	void                   (*queue_message)   (SoupSession *session, SoupMessage *msg,
+								  SoupSessionCallback callback,
+								  gpointer user_data);
+	void                   (*requeue_message) (SoupSession *session, SoupMessage *msg);
+	guint                  (*send_message)    (SoupSession *session, SoupMessage *msg);
 
-	void  (*cancel_message)  (SoupSession *session, SoupMessage *msg,
-				  guint status_code);
+	void                   (*cancel_message)  (SoupSession *session, SoupMessage *msg,
+								  guint status_code);
 
-	void  (*auth_required)   (SoupSession *session, SoupMessage *msg,
-				  SoupAuth *auth, gboolean retrying);
+	void                   (*auth_required)   (SoupSession *session, SoupMessage *msg,
+								  SoupAuth *auth, gboolean retrying);
 
-	void  (*flush_queue)     (SoupSession *session);
+	void                   (*flush_queue)     (SoupSession *session);
 
-	void  (*kick)            (SoupSession *session);
+	void                   (*kick)            (SoupSession *session);
+
+	SoupIODispatcherPool*  (*get_io_dispatcher_pool) (SoupSession *session);
 
 	/* Padding for future expansion */
 	void (*_libsoup_reserved4) (void);
@@ -78,8 +80,9 @@ GType soup_session_get_type (void);
 #define SOUP_SESSION_ADD_FEATURE            "add-feature"
 #define SOUP_SESSION_ADD_FEATURE_BY_TYPE    "add-feature-by-type"
 #define SOUP_SESSION_REMOVE_FEATURE_BY_TYPE "remove-feature-by-type"
-#define SOUP_SESSION_HTTP_ALIASES       "http-aliases"
-#define SOUP_SESSION_HTTPS_ALIASES      "https-aliases"
+#define SOUP_SESSION_HTTP_ALIASES           "http-aliases"
+#define SOUP_SESSION_HTTPS_ALIASES          "https-aliases"
+
 
 GMainContext   *soup_session_get_async_context(SoupSession           *session);
 
@@ -117,21 +120,22 @@ gboolean        soup_session_would_redirect   (SoupSession           *session,
 gboolean        soup_session_redirect_message (SoupSession           *session,
 					       SoupMessage           *msg);
 
-void                soup_session_add_feature            (SoupSession        *session,
+void                  soup_session_add_feature            (SoupSession        *session,
 							 SoupSessionFeature *feature);
-void                soup_session_add_feature_by_type    (SoupSession        *session,
+void                  soup_session_add_feature_by_type    (SoupSession        *session,
 							 GType               feature_type);
-void                soup_session_remove_feature         (SoupSession        *session,
+void                  soup_session_remove_feature         (SoupSession        *session,
 							 SoupSessionFeature *feature);
-void                soup_session_remove_feature_by_type (SoupSession        *session,
+void                  soup_session_remove_feature_by_type (SoupSession        *session,
 							 GType               feature_type);
-GSList             *soup_session_get_features           (SoupSession        *session,
+GSList               *soup_session_get_features           (SoupSession        *session,
 							 GType               feature_type);
-SoupSessionFeature *soup_session_get_feature            (SoupSession        *session,
+SoupSessionFeature   *soup_session_get_feature            (SoupSession        *session,
 							 GType               feature_type);
-SoupSessionFeature *soup_session_get_feature_for_message(SoupSession        *session,
+SoupSessionFeature   *soup_session_get_feature_for_message(SoupSession        *session,
 							 GType               feature_type,
 							 SoupMessage        *msg);
+SoupIODispatcherPool *soup_session_get_io_dispatcher_pool (SoupSession *session);
 
 G_END_DECLS
 

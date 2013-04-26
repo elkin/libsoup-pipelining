@@ -28,6 +28,7 @@ typedef struct {
 	GObjectClass parent_class;
 
 	/* signals */
+	void (*connected)    (SoupConnection *);
 	void (*disconnected)    (SoupConnection *);
 
 } SoupConnectionClass;
@@ -49,9 +50,9 @@ typedef void  (*SoupConnectionCallback)        (SoupConnection   *conn,
 #define SOUP_CONNECTION_ASYNC_CONTEXT   "async-context"
 #define SOUP_CONNECTION_USE_THREAD_CONTEXT "use-thread-context"
 #define SOUP_CONNECTION_TIMEOUT         "timeout"
-#define SOUP_CONNECTION_IDLE_TIMEOUT    "idle-timeout"
 #define SOUP_CONNECTION_STATE           "state"
 #define SOUP_CONNECTION_MESSAGE         "message"
+#define SOUP_CONNECTION_IO_DISPATCHER   "io-disp"
 
 SoupConnection *soup_connection_new            (const char       *propname1,
 						...) G_GNUC_NULL_TERMINATED;
@@ -73,19 +74,16 @@ void            soup_connection_start_ssl_async  (SoupConnection   *conn,
 void            soup_connection_disconnect     (SoupConnection   *conn);
 
 SoupSocket     *soup_connection_get_socket     (SoupConnection   *conn);
+#if 0
+void            soup_connection_set_io_dispatcher (SoupConnection *conn,
+		SoupIODispatcher *io_disp);
+#endif
+void            soup_connection_set_io_dispatcher (SoupConnection *conn, SoupIODispatcher *io_disp);
+SoupIODispatcher *soup_connection_get_io_dispatcher(SoupConnection *conn);
 SoupURI        *soup_connection_get_proxy_uri  (SoupConnection   *conn);
 gboolean        soup_connection_is_via_proxy   (SoupConnection   *conn);
 
 SoupConnectionState soup_connection_get_state  (SoupConnection   *conn);
-void                soup_connection_set_state  (SoupConnection   *conn,
-						SoupConnectionState state);
-
-gboolean        soup_connection_get_ever_used  (SoupConnection   *conn);
-
-void            soup_connection_send_request   (SoupConnection          *conn,
-						SoupMessageQueueItem    *item,
-						SoupMessageCompletionFn  completion_cb,
-						gpointer                 user_data);
 
 gboolean        soup_connection_get_ssl_fallback (SoupConnection   *conn);
 

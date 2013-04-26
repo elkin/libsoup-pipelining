@@ -12,6 +12,7 @@
 #include "soup-auth.h"
 #include "soup-connection.h"
 #include "soup-enum-types.h"
+#include "soup-io-dispatcher.h"
 #include "soup-marshal.h"
 #include "soup-message.h"
 #include "soup-message-private.h"
@@ -161,7 +162,13 @@ finalize (GObject *object)
 	SoupMessage *msg = SOUP_MESSAGE (object);
 	SoupMessagePrivate *priv = SOUP_MESSAGE_GET_PRIVATE (msg);
 
-	soup_message_io_cleanup (msg);
+	SoupIODispatcher *io_disp = priv->io_disp;
+
+	if (io_disp) {
+	    soup_io_dispatcher_cancel_message (io_disp, msg);
+	    priv->io_disp = NULL;
+	}
+
 	if (priv->chunk_allocator_dnotify)
 		priv->chunk_allocator_dnotify (priv->chunk_allocator_data);
 

@@ -112,18 +112,25 @@ libsoup_2_4_la_SOURCES =		\
 	soup-headers.c			\
 	soup-http-input-stream.h	\
 	soup-http-input-stream.c	\
+	soup-io-dispatcher.h		\
+	soup-io-dispatcher.c		\
+	soup-io-dispatcher-client.h	\
+	soup-io-dispatcher-client.c	\
+	soup-io-dispatcher-misc.h	\
+	soup-io-dispatcher-misc.c	\
+	soup-io-dispatcher-pool.h	\
+	soup-io-dispatcher-pool.c	\
+	soup-io-dispatcher-server.h	\
+	soup-io-dispatcher-server.c	\
 	soup-logger.c			\
 	soup-marshal.h			\
 	soup-marshal.c			\
 	soup-message.c			\
 	soup-message-body.c		\
-	soup-message-client-io.c	\
 	soup-message-headers.c		\
-	soup-message-io.c		\
 	soup-message-private.h		\
 	soup-message-queue.h		\
 	soup-message-queue.c		\
-	soup-message-server-io.c	\
 	soup-method.c     		\
 	soup-misc.c     		\
 	soup-misc-private.h		\

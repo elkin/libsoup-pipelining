@@ -31,6 +31,7 @@
 
 typedef struct {
 	SoupSocket  *socket;
+	SoupIODispatcher *io_disp;
 
 	SoupAddress *remote_addr, *tunnel_addr;
 	SoupURI     *proxy_uri;
@@ -40,11 +41,9 @@ typedef struct {
 	GMainContext *async_context;
 	gboolean      use_thread_context;
 
-	SoupMessageQueueItem *cur_item;
 	SoupConnectionState state;
-	time_t       unused_timeout;
-	guint        io_timeout, idle_timeout;
-	GSource     *idle_timeout_src;
+	guint        io_timeout;
+	SoupSession *session;
 } SoupConnectionPrivate;
 #define SOUP_CONNECTION_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), SOUP_TYPE_CONNECTION, SoupConnectionPrivate))
 
@@ -52,6 +51,7 @@ G_DEFINE_TYPE (SoupConnection, soup_connection, G_TYPE_OBJECT)
 
 enum {
 	EVENT,
+	CONNECTED,
 	DISCONNECTED,
 	LAST_SIGNAL
 };
@@ -61,6 +61,7 @@ static guint signals[LAST_SIGNAL] = { 0 };
 enum {
 	PROP_0,
 
+	PROP_IO_DISPATCHER,
 	PROP_REMOTE_ADDRESS,
 	PROP_TUNNEL_ADDRESS,
 	PROP_PROXY_URI,
@@ -71,7 +72,6 @@ enum {
 	PROP_ASYNC_CONTEXT,
 	PROP_USE_THREAD_CONTEXT,
 	PROP_TIMEOUT,
-	PROP_IDLE_TIMEOUT,
 	PROP_STATE,
 	PROP_MESSAGE,
 
@@ -82,14 +82,7 @@ static void set_property (GObject *object, guint prop_id,
 			  const GValue *value, GParamSpec *pspec);
 static void get_property (GObject *object, guint prop_id,
 			  GValue *value, GParamSpec *pspec);
-
-static void stop_idle_timer (SoupConnectionPrivate *priv);
-static void clear_current_item (SoupConnection *conn);
-
-/* Number of seconds after which we close a connection that hasn't yet
- * been used.
- */
-#define SOUP_CONNECTION_UNUSED_TIMEOUT 3
+static void set_state (SoupConnection *conn, SoupConnectionState state);
 
 static void
 soup_connection_init (SoupConnection *conn)
@@ -102,6 +95,8 @@ finalize (GObject *object)
 {
 	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (object);
 
+	if (priv->io_disp)
+		g_object_unref (priv->io_disp);
 	if (priv->remote_addr)
 		g_object_unref (priv->remote_addr);
 	if (priv->tunnel_addr)
@@ -122,14 +117,6 @@ dispose (GObject *object)
 	SoupConnection *conn = SOUP_CONNECTION (object);
 	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (conn);
 
-	stop_idle_timer (priv);
-	/* Make sure clear_current_item doesn't re-establish the timeout */
-	priv->idle_timeout = 0;
-
-	if (priv->cur_item) {
-		g_warning ("Disposing connection with cur_item set");
-		clear_current_item (conn);
-	}
 	if (priv->socket) {
 		g_warning ("Disposing connection while connected");
 		soup_connection_disconnect (conn);
@@ -162,6 +149,18 @@ soup_connection_class_init (SoupConnectionClass *connection_class)
 			      G_TYPE_NONE, 2,
 			      G_TYPE_SOCKET_CLIENT_EVENT,
 			      G_TYPE_IO_STREAM);
+
+	signals[CONNECTED] =
+			g_signal_new ("connected",
+				      G_OBJECT_CLASS_TYPE (object_class),
+				      G_SIGNAL_RUN_FIRST,
+				      G_STRUCT_OFFSET (SoupConnectionClass, connected),
+				      NULL, NULL,
+				      _soup_marshal_NONE__OBJECT,
+				      G_TYPE_NONE, 0);
+
+
+
 	signals[DISCONNECTED] =
 		g_signal_new ("disconnected",
 			      G_OBJECT_CLASS_TYPE (object_class),
@@ -172,6 +171,14 @@ soup_connection_class_init (SoupConnectionClass *connection_class)
 			      G_TYPE_NONE, 0);
 
 	/* properties */
+	g_object_class_install_property (
+		object_class, PROP_IO_DISPATCHER,
+		g_param_spec_object (SOUP_CONNECTION_IO_DISPATCHER,
+				     "I/O Dispatcher",
+				     "I/O Dispatcher for this connection",
+				     G_TYPE_TLS_DATABASE,
+				     G_PARAM_READWRITE));
+
 	g_object_class_install_property (
 		object_class, PROP_REMOTE_ADDRESS,
 		g_param_spec_object (SOUP_CONNECTION_REMOTE_ADDRESS,
@@ -186,6 +193,7 @@ soup_connection_class_init (SoupConnectionClass *connection_class)
 				     "The address of the HTTPS server this tunnel connects to",
 				     SOUP_TYPE_ADDRESS,
 				     G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY));
+
 	g_object_class_install_property (
 		object_class, PROP_PROXY_URI,
 		g_param_spec_boxed (SOUP_CONNECTION_PROXY_URI,
@@ -242,26 +250,12 @@ soup_connection_class_init (SoupConnectionClass *connection_class)
 				   0, G_MAXUINT, 0,
 				   G_PARAM_READWRITE));
 	g_object_class_install_property (
-		object_class, PROP_IDLE_TIMEOUT,
-		g_param_spec_uint (SOUP_CONNECTION_IDLE_TIMEOUT,
-				   "Idle Timeout",
-				   "Connection lifetime when idle",
-				   0, G_MAXUINT, 0,
-				   G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY));
-	g_object_class_install_property (
 		object_class, PROP_STATE,
 		g_param_spec_enum (SOUP_CONNECTION_STATE,
 				   "Connection state",
 				   "Current state of connection",
 				   SOUP_TYPE_CONNECTION_STATE, SOUP_CONNECTION_NEW,
-				   G_PARAM_READWRITE));
-	g_object_class_install_property (
-		object_class, PROP_MESSAGE,
-		g_param_spec_object (SOUP_CONNECTION_MESSAGE,
-				     "Message",
-				     "Message being processed",
-				     SOUP_TYPE_MESSAGE,
-				     G_PARAM_READABLE));
+				   G_PARAM_READABLE));
 }
 
 
@@ -286,6 +280,12 @@ set_property (GObject *object, guint prop_id,
 	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (object);
 
 	switch (prop_id) {
+	case PROP_IO_DISPATCHER:
+		if (priv->io_disp)
+			g_object_unref (priv->io_disp);
+
+		priv->io_disp = g_object_ref (g_value_get_object (value));
+		break;
 	case PROP_REMOTE_ADDRESS:
 		priv->remote_addr = g_value_dup_object (value);
 		break;
@@ -322,12 +322,6 @@ set_property (GObject *object, guint prop_id,
 	case PROP_TIMEOUT:
 		priv->io_timeout = g_value_get_uint (value);
 		break;
-	case PROP_IDLE_TIMEOUT:
-		priv->idle_timeout = g_value_get_uint (value);
-		break;
-	case PROP_STATE:
-		soup_connection_set_state (SOUP_CONNECTION (object), g_value_get_uint (value));
-		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 		break;
@@ -341,6 +335,9 @@ get_property (GObject *object, guint prop_id,
 	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (object);
 
 	switch (prop_id) {
+	case PROP_IO_DISPATCHER:
+		g_value_set_object (value, priv->io_disp);
+		break;
 	case PROP_REMOTE_ADDRESS:
 		g_value_set_object (value, priv->remote_addr);
 		break;
@@ -371,17 +368,8 @@ get_property (GObject *object, guint prop_id,
 	case PROP_TIMEOUT:
 		g_value_set_uint (value, priv->io_timeout);
 		break;
-	case PROP_IDLE_TIMEOUT:
-		g_value_set_uint (value, priv->idle_timeout);
-		break;
 	case PROP_STATE:
 		g_value_set_enum (value, priv->state);
-		break;
-	case PROP_MESSAGE:
-		if (priv->cur_item)
-			g_value_set_object (value, priv->cur_item->msg);
-		else
-			g_value_set_object (value, NULL);
 		break;
 	default:
 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -389,108 +377,21 @@ get_property (GObject *object, guint prop_id,
 	}
 }
 
-static gboolean
-idle_timeout (gpointer conn)
-{
-	soup_connection_disconnect (conn);
-	return FALSE;
-}
-
 static void
-start_idle_timer (SoupConnection *conn)
+set_state (SoupConnection *conn, SoupConnectionState state)
 {
-	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (conn);
+	SoupConnectionPrivate *priv;
 
-	if (priv->idle_timeout > 0 && !priv->idle_timeout_src) {
-		priv->idle_timeout_src =
-			soup_add_timeout (priv->async_context,
-					  priv->idle_timeout * 1000,
-					  idle_timeout, conn);
-	}
+	g_return_if_fail (SOUP_IS_CONNECTION (conn));
+	g_return_if_fail (state >= SOUP_CONNECTION_NEW &&
+			  state <= SOUP_CONNECTION_DISCONNECTED);
+
+	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
+	priv->state = state;
+
+	g_object_notify (G_OBJECT (conn), "state");
 }
 
-static void
-stop_idle_timer (SoupConnectionPrivate *priv)
-{
-	if (priv->idle_timeout_src) {
-		g_source_destroy (priv->idle_timeout_src);
-		priv->idle_timeout_src = NULL;
-	}
-}
-
-static void
-current_item_restarted (SoupMessage *msg, gpointer user_data)
-{
-	SoupConnection *conn = user_data;
-	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (conn);
-
-	priv->unused_timeout = 0;
-}
-
-static void
-set_current_item (SoupConnection *conn, SoupMessageQueueItem *item)
-{
-	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (conn);
-
-	g_return_if_fail (priv->cur_item == NULL);
-
-	g_object_freeze_notify (G_OBJECT (conn));
-
-	stop_idle_timer (priv);
-
-	item->state = SOUP_MESSAGE_RUNNING;
-	priv->cur_item = item;
-	g_object_notify (G_OBJECT (conn), "message");
-
-	g_signal_connect (item->msg, "restarted",
-			  G_CALLBACK (current_item_restarted), conn);
-
-	if (item->msg->method == SOUP_METHOD_CONNECT) {
-		g_signal_emit (conn, signals[EVENT], 0,
-			       G_SOCKET_CLIENT_PROXY_NEGOTIATING,
-			       soup_socket_get_iostream (priv->socket));
-	} else if (priv->state == SOUP_CONNECTION_IDLE)
-		soup_connection_set_state (conn, SOUP_CONNECTION_IN_USE);
-
-	g_object_thaw_notify (G_OBJECT (conn));
-}
-
-static void
-clear_current_item (SoupConnection *conn)
-{
-	SoupConnectionPrivate *priv = SOUP_CONNECTION_GET_PRIVATE (conn);
-
-	g_object_freeze_notify (G_OBJECT (conn));
-
-	priv->unused_timeout = 0;
-	start_idle_timer (conn);
-
-	if (priv->cur_item) {
-		SoupMessageQueueItem *item;
-
-		item = priv->cur_item;
-		priv->cur_item = NULL;
-		g_object_notify (G_OBJECT (conn), "message");
-
-		g_signal_handlers_disconnect_by_func (item->msg, G_CALLBACK (current_item_restarted), conn);
-
-		if (item->msg->method == SOUP_METHOD_CONNECT &&
-		    SOUP_STATUS_IS_SUCCESSFUL (item->msg->status_code)) {
-			g_signal_emit (conn, signals[EVENT], 0,
-				       G_SOCKET_CLIENT_PROXY_NEGOTIATED,
-				       soup_socket_get_iostream (priv->socket));
-
-			/* We're now effectively no longer proxying */
-			soup_uri_free (priv->proxy_uri);
-			priv->proxy_uri = NULL;
-		}
-
-		if (!soup_message_is_keepalive (item->msg))
-			soup_connection_disconnect (conn);
-	}
-
-	g_object_thaw_notify (G_OBJECT (conn));
-}
 
 static void
 soup_connection_event (SoupConnection      *conn,
@@ -557,9 +458,10 @@ socket_connect_finished (SoupSocket *socket, guint status, gpointer user_data)
 					       NULL);
 		}
 
-		soup_connection_set_state (data->conn, SOUP_CONNECTION_IN_USE);
-		priv->unused_timeout = time (NULL) + SOUP_CONNECTION_UNUSED_TIMEOUT;
-		start_idle_timer (data->conn);
+		set_state (data->conn, SOUP_CONNECTION_CONNECTED);
+
+		g_signal_emit (data->conn, signals[CONNECTED], 0, socket);
+
 	} else if (status == SOUP_STATUS_TLS_FAILED) {
 		priv->ssl_fallback = TRUE;
 		status = SOUP_STATUS_TRY_AGAIN;
@@ -611,7 +513,7 @@ soup_connection_connect_async (SoupConnection *conn,
 	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
 	g_return_if_fail (priv->socket == NULL);
 
-	soup_connection_set_state (conn, SOUP_CONNECTION_CONNECTING);
+	set_state (conn, SOUP_CONNECTION_CONNECTING);
 
 	data = g_slice_new (SoupConnectionAsyncConnectData);
 	data->conn = g_object_ref (conn);
@@ -647,7 +549,7 @@ soup_connection_connect_sync (SoupConnection *conn, GCancellable *cancellable)
 	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
 	g_return_val_if_fail (priv->socket == NULL, SOUP_STATUS_MALFORMED);
 
-	soup_connection_set_state (conn, SOUP_CONNECTION_CONNECTING);
+	set_state (conn, SOUP_CONNECTION_CONNECTING);
 
 	priv->socket =
 		soup_socket_new (SOUP_SOCKET_REMOTE_ADDRESS, priv->remote_addr,
@@ -694,9 +596,9 @@ soup_connection_connect_sync (SoupConnection *conn, GCancellable *cancellable)
 					       G_SOCKET_CLIENT_COMPLETE,
 					       NULL);
 		}
-		soup_connection_set_state (conn, SOUP_CONNECTION_IN_USE);
-		priv->unused_timeout = time (NULL) + SOUP_CONNECTION_UNUSED_TIMEOUT;
-		start_idle_timer (conn);
+
+		g_signal_emit (conn, signals[CONNECTED], 0, priv->socket);
+
 	} else {
 	fail:
 		if (priv->socket) {
@@ -839,7 +741,7 @@ soup_connection_disconnect (SoupConnection *conn)
 
 	old_state = priv->state;
 	if (old_state != SOUP_CONNECTION_DISCONNECTED)
-		soup_connection_set_state (conn, SOUP_CONNECTION_DISCONNECTED);
+		set_state (conn, SOUP_CONNECTION_DISCONNECTED);
 
 	if (priv->socket) {
 		g_signal_handlers_disconnect_by_func (priv->socket,
@@ -859,6 +761,31 @@ soup_connection_get_socket (SoupConnection *conn)
 	g_return_val_if_fail (SOUP_IS_CONNECTION (conn), NULL);
 
 	return SOUP_CONNECTION_GET_PRIVATE (conn)->socket;
+}
+
+void
+soup_connection_set_io_dispatcher (SoupConnection *conn, SoupIODispatcher *io_disp)
+{
+	SoupConnectionPrivate *priv;
+	g_return_if_fail (SOUP_IS_CONNECTION (conn));
+	g_return_if_fail (SOUP_IS_IO_DISPATCHER (io_disp));
+
+	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
+	if (priv->io_disp)
+		g_object_unref (io_disp);
+
+	priv->io_disp = g_object_ref (io_disp);
+
+	g_object_notify (G_OBJECT (conn), SOUP_CONNECTION_IO_DISPATCHER);
+}
+
+
+SoupIODispatcher*
+soup_connection_get_io_dispatcher (SoupConnection *conn)
+{
+	g_return_val_if_fail (SOUP_IS_CONNECTION (conn), NULL);
+
+	return SOUP_CONNECTION_GET_PRIVATE (conn)->io_disp;
 }
 
 SoupURI *
@@ -886,47 +813,11 @@ soup_connection_get_state (SoupConnection *conn)
 			      SOUP_CONNECTION_DISCONNECTED);
 	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
 
-	if (priv->state == SOUP_CONNECTION_IDLE &&
+	if (priv->state != SOUP_CONNECTION_DISCONNECTED && soup_io_dispatcher_is_queue_empty (priv->io_disp) &&
 	    g_socket_condition_check (soup_socket_get_gsocket (priv->socket), G_IO_IN))
-		soup_connection_set_state (conn, SOUP_CONNECTION_REMOTE_DISCONNECTED);
-
-	if (priv->state == SOUP_CONNECTION_IDLE &&
-	    priv->unused_timeout && priv->unused_timeout < time (NULL))
-		soup_connection_set_state (conn, SOUP_CONNECTION_REMOTE_DISCONNECTED);
+		set_state (conn, SOUP_CONNECTION_REMOTE_DISCONNECTED);
 
 	return priv->state;
-}
-
-void
-soup_connection_set_state (SoupConnection *conn, SoupConnectionState state)
-{
-	SoupConnectionPrivate *priv;
-	SoupConnectionState old_state;
-
-	g_return_if_fail (SOUP_IS_CONNECTION (conn));
-	g_return_if_fail (state >= SOUP_CONNECTION_NEW &&
-			  state <= SOUP_CONNECTION_DISCONNECTED);
-
-	g_object_freeze_notify (G_OBJECT (conn));
-
-	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
-	old_state = priv->state;
-	priv->state = state;
-	if ((state == SOUP_CONNECTION_IDLE ||
-	     state == SOUP_CONNECTION_DISCONNECTED) &&
-	    old_state == SOUP_CONNECTION_IN_USE)
-		clear_current_item (conn);
-
-	g_object_notify (G_OBJECT (conn), "state");
-	g_object_thaw_notify (G_OBJECT (conn));
-}
-
-gboolean
-soup_connection_get_ever_used (SoupConnection *conn)
-{
-	g_return_val_if_fail (SOUP_IS_CONNECTION (conn), FALSE);
-
-	return SOUP_CONNECTION_GET_PRIVATE (conn)->unused_timeout == 0;
 }
 
 gboolean
@@ -935,20 +826,3 @@ soup_connection_get_ssl_fallback (SoupConnection *conn)
 	return SOUP_CONNECTION_GET_PRIVATE (conn)->ssl_fallback;
 }
 
-void
-soup_connection_send_request (SoupConnection          *conn,
-			      SoupMessageQueueItem    *item,
-			      SoupMessageCompletionFn  completion_cb,
-			      gpointer                 user_data)
-{
-	SoupConnectionPrivate *priv;
-
-	g_return_if_fail (SOUP_IS_CONNECTION (conn));
-	g_return_if_fail (item != NULL);
-	priv = SOUP_CONNECTION_GET_PRIVATE (conn);
-	g_return_if_fail (priv->state != SOUP_CONNECTION_NEW && priv->state != SOUP_CONNECTION_DISCONNECTED);
-
-	if (item != priv->cur_item)
-		set_current_item (conn, item);
-	soup_message_send_request (item, completion_cb, user_data);
-}
